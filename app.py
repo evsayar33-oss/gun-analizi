@@ -2,104 +2,132 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import yfinance as yf
-from datetime import datetime
+from datetime import datetime, timedelta
+import requests
 
-# 1. AYARLAR
-st.set_page_config(page_title="Macro Matrix Pro", layout="wide")
+# 1. AYARLAR VE TASARIM
+st.set_page_config(page_title="Macro Matrix V3 - FRED Edition", layout="wide")
 st.markdown("<style>.main { background-color: #0d1117; color: white; }</style>", unsafe_allow_html=True)
 
-# 2. VERİ MOTORU
-@st.cache_data(ttl=120)
-def get_data():
-    # Vadeli semboller: ES=F (S&P), NQ=F (Nasdaq), GC=F (Altın), SI=F (Gümüş)
-    syms = {'SPX':'ES=F', 'NDX':'NQ=F', 'XAU':'GC=F', 'XAG':'SI=F', 'DXY':'DX-Y.NYB', 'TNX':'^TNX', 'VIX':'^VIX', 'HYG':'HYG'}
-    df_d = yf.download(list(syms.values()), period="1y", interval="1d")['Close'].ffill()
-    df_d = df_d.rename(columns={v: k for k, v in syms.items()})
-    df_h = yf.download(list(syms.values()), period="5d", interval="1h")['Close'].ffill()
-    df_h = df_h.rename(columns={v: k for k, v in syms.items()})
-    return df_d, df_h
+# SIDEBAR - FRED API KEY GİRİŞİ
+st.sidebar.header("⚙️ Veri Ayarları")
+fred_api_key = st.sidebar.text_input("FRED API Key Girin:", type="password")
+st.sidebar.info("Likidite verisi (WALCL) için FRED Key gereklidir.")
 
-# 3. OOS HIT-RATE HESAPLAMA
-def calc_hit_rate(df):
-    def z(s): return (s - s.rolling(126).mean()) / s.rolling(126).std()
-    # 5 gün önceki makro sinyal vs 5 gün sonraki getiri
-    z_c = (z(df['TNX'] - 2.1) + z(df['DXY'])) / 2
-    past_sig = -z_c.shift(5)
-    fwd_ret = df['SPX'].pct_change(5)
-    hits = (np.sign(past_sig) == np.sign(fwd_ret)).tail(60)
-    return hits.mean() * 100
-
-# 4. MOTORU ÇALIŞTIR
-try:
-    df_d, df_h = get_data()
-    hr = calc_hit_rate(df_d)
+# 2. VERİ MOTORU (YAHOO + FRED)
+@st.cache_data(ttl=3600)
+def get_macro_data(api_key):
+    # Yahoo Sembolleri
+    syms = {'SPX':'ES=F', 'NDX':'NQ=F', 'XAU':'GC=F', 'XAG':'SI=F', 'DXY':'DX-Y.NYB', 'TNX':'^TNX', 'VIX':'^VIX'}
+    df_y = yf.download(list(syms.values()), period="1y", interval="1d")['Close'].ffill()
+    df_y = df_y.rename(columns={v: k for k, v in syms.items()})
     
-    st.title("🏛️ MACRO MATRIX TERMINAL")
+    # FRED Verileri (WALCL, T10YIE, Kredi Spread)
+    # API key yoksa boş döner
+    fred_data = pd.DataFrame(index=df_y.index)
+    if api_key:
+        try:
+            # WALCL (Likidite), T10YIE (Enflasyon Beklentisi), BAMLH0A0HYM2 (Spread)
+            for series in ['WALCL', 'T10YIE', 'BAMLH0A0HYM2']:
+                url = f"https://api.stlouisfed.org/fred/series/observations?series_id={series}&api_key={api_key}&file_type=json"
+                r = requests.get(url).json()
+                obs = pd.DataFrame(r['observations'])[['date', 'value']]
+                obs['value'] = pd.to_numeric(obs['value'], errors='coerce')
+                obs['date'] = pd.to_datetime(obs['date'])
+                obs = obs.set_index('date')
+                fred_data[series] = obs['value']
+            fred_data = fred_data.ffill().reindex(df_y.index).ffill()
+        except:
+            st.sidebar.error("FRED API Hatası! Key'i kontrol edin.")
+            
+    return df_y, fred_data
 
-    # --- OOS HIT-RATE ROZETİ ---
-    if hr >= 60:
-        h_c, h_t = "#00ff00", "YEŞİL (ABD/Dolar Mantığı Kusursuz)"
-    elif hr >= 45:
-        h_c, h_t = "#ffff00", "SARI (Verim Düşüyor, Rejim Değişiyor)"
+# 3. ROLLING Z-SCORE (SON 126 GÜN)
+def z_rolling(series):
+    return (series - series.rolling(126).mean()) / series.rolling(126).std()
+
+# 4. ANALİZ MOTORU
+try:
+    df_y, df_f = get_macro_data(fred_api_key)
+    
+    # REEL FAİZ: Rolling Z-Score (126 Gün)
+    # (10Y Nominal - Breakeven) kullanılıyor, yoksa proxy.
+    if 'T10YIE' in df_f.columns:
+        reel_faiz_raw = df_y['TNX'] - df_f['T10YIE']
     else:
-        h_c, h_t = "#ff4b4b", "KIRMIZI (PARADİGMA KAYMASI! Güncelle)"
+        reel_faiz_raw = df_y['TNX'] - 2.1 # Fallback
+    
+    z_rf = z_rolling(reel_faiz_raw)
+    z_dxy = z_rolling(df_y['DXY'])
+    z_comp = (z_rf + z_dxy) / 2
+    
+    # LİKİDİTE (WALCL) Z-SCORE
+    if 'WALCL' in df_f.columns:
+        z_liq = z_rolling(df_f['WALCL'])
+    else:
+        z_liq = -z_rolling(df_y['TNX']) # Fallback (Ters korelasyon)
 
+    # KREDİ SPREAD (BAML) Z-SCORE
+    if 'BAMLH0A0HYM2' in df_f.columns:
+        z_spr = z_rolling(df_f['BAMLH0A0HYM2'])
+    else:
+        z_spr = z_rolling(100 - yf.download('HYG', period="1y")['Close'])
+
+    # --- OOS HIT-RATE HESAPLAMA ---
+    past_sig = -z_comp.shift(5)
+    fwd_ret = df_y['SPX'].pct_change(5)
+    hits = (np.sign(past_sig) == np.sign(fwd_ret)).tail(60)
+    hr = hits.mean() * 100
+
+    # UI BAŞLIĞI VE ROZET
+    st.title("🏛️ MACRO MATRIX TERMINAL V3")
+    
+    h_c = "#00ff00" if hr >= 60 else "#ffff00" if hr >= 45 else "#ff4b4b"
     st.markdown(f"""
-        <div style="border: 2px solid {h_c}; padding:10px; border-radius:10px; text-align:center; background:rgba(0,0,0,0.2);">
-            <small style="color:{h_c}">OOS HIT-RATE GÜVEN ROZETİ</small><br>
-            <b style="font-size:24px; color:{h_c}">%{hr:.1f}</b><br>
-            <span style="color:{h_c}; font-size:12px;">{h_t}</span>
+        <div style="border:2px solid {h_c}; padding:10px; border-radius:10px; text-align:center; background:rgba(0,0,0,0.2); margin-bottom:20px;">
+            <b style="color:{h_c}; font-size:24px;">%{hr:.1f} OOS HIT-RATE</b><br>
+            <span style="color:{h_c};">Dinamik 126g Rolling Z-Skor Aktif</span>
         </div>
     """, unsafe_allow_html=True)
 
-    # Üst Göstergeler
-    st.write("---")
-    def z_val(s): return (s - s.rolling(126).mean()) / s.rolling(126).std()
-    z_comp = (z_val(df_d['TNX'] - 2.1) + z_val(df_d['DXY'])) / 2
-    z_liq = -z_val(df_d['TNX'])
-    z_spr = z_val(100 - df_d['HYG'])
+    # GÖSTERGE PANELLERİ
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("10Y Reel (Rolling)", f"%{reel_faiz_raw.iloc[-1]:.2f}", f"{z_rf.iloc[-1]:.2f}z")
+    m2.metric("DXY", f"{df_y['DXY'].iloc[-1]:.2f}", f"{z_dxy.iloc[-1]:.2f}z")
+    m3.metric("Likidite (WALCL)", f"{df_f['WALCL'].iloc[-1]/1000 if 'WALCL' in df_f else 0:.1f}T", f"{z_liq.iloc[-1]:.2f}z")
+    m4.metric("Kredi Spread", f"%{df_f['BAMLH0A0HYM2'].iloc[-1] if 'BAMLH0A0HYM2' in df_f else 0:.2f}", f"{z_spr.iloc[-1]:.2f}z")
 
-    c1, c2, c3 = st.columns(3)
-    c1.metric("10Y Reel", f"%{df_d['TNX'].iloc[-1]-2.1:.2f}")
-    c2.metric("DXY", f"{df_d['DXY'].iloc[-1]:.2f}")
-    c3.metric("VIX", f"{df_d['VIX'].iloc[-1]:.2f}")
+    st.divider()
 
-    # Varlıklar
+    # VARLIK KARTLARI
     assets = {'SPX':[-1,1,-1], 'NDX':[-1,1,-1], 'XAU':[-1,1,1], 'XAG':[-1,1,-1]}
+    cols = st.columns(2)
     
-    for name, signs in assets.items():
-        # Dinamik Altın Rejimi
-        spr_sign = signs[2]
-        if name == 'XAU' and z_val(df_d['VIX']).iloc[-1] > 2.0:
-            spr_sign = -1
-            
-        m_skor = (0.4 * z_comp.iloc[-1] * signs[0]) + (0.3 * z_liq.iloc[-1] * signs[1]) + (0.3 * z_spr.iloc[-1] * spr_sign)
-        v_4h = ((df_h[name].iloc[-1] / df_h[name].iloc[-5]) - 1) * 100
+    for i, (name, signs) in enumerate(assets.items()):
+        # Skor: 40% Faiz/Dolar, 30% Likidite, 30% Spread
+        m_skor = (0.4 * z_comp.iloc[-1] * signs[0]) + (0.3 * z_liq.iloc[-1] * signs[1]) + (0.3 * z_spr.iloc[-1] * signs[2])
+        
+        # Canlı İvme (Son 4 Saat)
+        df_h = yf.download(yf.Ticker(name).ticker if name not in ['SPX','NDX'] else ('ES=F' if name=='SPX' else 'NQ=F'), period="2d", interval="1h")['Close']
+        v_4h = ((df_h.iloc[-1] / df_h.iloc[-5]) - 1) * 100
         
         p_clr = "#00ff00" if v_4h > 0 else "#ff4b4b"
-        m_clr = "green" if m_skor > 0 else "red"
+        sig = "AL" if m_skor > 0.4 else "SAT" if m_skor < -0.4 else "NOTR"
         
-        # Durum Mesajı
-        if v_4h > 0.15:
-            msg = "GÜÇLÜ TREND" if m_skor > 0 else "MAKROYA DİRENEN YÜKSELİŞ"
-        elif v_4h < -0.15:
-            msg = "GÜÇLÜ SATIŞ" if m_skor < 0 else "BOĞA DÜZELTMESİ"
-        else:
-            msg = "KARARSIZ / BEKLE"
-
-        st.markdown(f"""
-            <div style="border:1px solid #333; padding:15px; border-radius:10px; margin-bottom:10px; background:#161b22;">
-                <div style="display:flex; justify-content:space-between;">
-                    <b>{name}</b> <b style="color:{p_clr}">%{v_4h:.2f}</b>
+        with cols[i%2]:
+            st.markdown(f"""
+                <div style="border:1px solid #333; padding:15px; border-radius:10px; margin-bottom:10px; background:#161b22;">
+                    <div style="display:flex; justify-content:space-between;">
+                        <b>{name}</b> <b style="color:{p_clr}">%{v_4h:.2f}</b>
+                    </div>
+                    <div style="font-size:12px; margin:5px 0;">
+                        Makro Skor: {m_skor:.2f} | Yön: {'BOĞA' if m_skor>0 else 'AYI'}
+                    </div>
+                    <div style="background:#0d1117; padding:8px; border-radius:5px; border-left:4px solid {p_clr};">
+                        {sig} - {'TREND DEVAM' if np.sign(m_skor)==np.sign(v_4h) else 'DIVERJANZ / TUZAK'}
+                    </div>
                 </div>
-                <div style="font-size:12px; margin:5px 0;">
-                    Fiyat: {df_h[name].iloc[-1]:.2f} | Makro: <span style="color:{m_clr}">{'BOĞA' if m_skor>0 else 'AYI'}</span>
-                </div>
-                <div style="background:#0d1117; padding:8px; border-radius:5px; border-left:4px solid {p_clr}; font-size:14px;">
-                    {msg}
-                </div>
-            </div>
-        """, unsafe_allow_html=True)
+            """, unsafe_allow_html=True)
 
 except Exception as e:
-    st.error(f"Hata: {e}")
+    st.error(f"Sistem Hatası: {e}")

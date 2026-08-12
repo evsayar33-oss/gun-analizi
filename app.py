@@ -2,41 +2,42 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import yfinance as yf
-import datetime
 
-# 1. TEMEL SAYFA AYARI
+# 1. TEMEL SAYFA AYARLARI
 st.set_page_config(page_title="Macro Matrix Pro", layout="wide")
 
-st.title("🏛️ MACRO YÖN MATRİSİ")
-st.write("Sistem başlatılıyor, lütfen bekleyin...")
+st.markdown("""
+    <style>
+    .main { background-color: #0d1117; color: white; }
+    .card { border: 1px solid #30363d; padding: 15px; border-radius: 10px; margin-bottom: 10px; }
+    </style>
+    """, unsafe_allow_html=True)
 
-# 2. VERİ ÇEKME (DAHA GÜVENLİ VE HIZLI)
+st.title("🏛️ MACRO YÖN MATRİSİ")
+
+# 2. VERİ ÇEKME
 @st.cache_data(ttl=600)
-def fetch_data():
+def get_data():
     tickers = {
         'SPX': '^GSPC', 'NDX': '^NDX', 'XAU': 'GC=F', 'XAG': 'SI=F',
         'DXY': 'DX-Y.NYB', 'TNX': '^TNX', 'VIX': '^VIX', 'VXN': '^VXN', 'HYG': 'HYG'
     }
-    # Verileri çek
-    with st.spinner('Piyasa verileri Yahoo Finance üzerinden çekiliyor...'):
-        df = yf.download(list(tickers.values()), period="1y", interval="1d")['Close']
-        df = df.rename(columns={v: k for k, v in tickers.items()})
-        df = df.ffill().dropna()
-        
-        # Makro Çapalar
-        df['REEL_FAIZ'] = df['TNX'] - 2.1
-        df['SPREAD'] = 100 - df['HYG']
+    df = yf.download(list(tickers.values()), period="1y", interval="1d")['Close']
+    df = df.rename(columns={v: k for k, v in tickers.items()})
+    df = df.ffill().dropna()
+    df['REEL_FAIZ'] = df['TNX'] - 2.1
+    df['SPREAD'] = 100 - df['HYG']
     return df
 
-# 3. HESAPLAMA FONKSİYONU
-def run_analysis(df):
-    def z_score(s): return (s - s.rolling(126).mean()) / s.rolling(126).std()
+# 3. ANA HESAPLAMA MOTORU
+def run_macro_engine(df):
+    def z(s): return (s - s.rolling(126).mean()) / s.rolling(126).std()
     
-    z_rf = z_score(df['REEL_FAIZ'])
-    z_dxy = z_score(df['DXY'])
+    z_rf = z(df['REEL_FAIZ'])
+    z_dxy = z(df['DXY'])
     z_df_comp = (z_rf + z_dxy) / 2
-    z_liq = -z_score(df['TNX'])
-    z_spr = z_score(df['SPREAD'])
+    z_liq = -z(df['TNX'])
+    z_spr = z(df['SPREAD'])
 
     assets = {
         'SPX': {'vol': 'VIX', 'base': [0.4, 0.3, 0.3], 'signs': [-1, 1, -1]},
@@ -45,39 +46,33 @@ def run_analysis(df):
         'XAG': {'vol': 'VIX', 'base': [0.4, 0.3, 0.3], 'signs': [-1, 1, -1]}
     }
     
-    res = {}
+    results = {}
     for name, cfg in assets.items():
-        daily_ret = df[name].pct_change().iloc[-1]
-        vol_z = z_score(df[cfg['vol']]).iloc[-1]
+        # Rolling IC ve Ağırlıklandırma
+        fwd = df[name].pct_change(5).shift(-5)
+        factors = [z_df_comp, z_liq, z_spr]
+        weights = []
+        for i, f in enumerate(factors):
+            ic = f.rolling(126).corr(fwd).iloc[-1]
+            if np.isnan(ic): ic = 0.05
+            ic_m = np.clip(1 + (ic * cfg['signs'][i]), 0.5, 1.5)
+            weights.append(cfg['base'][i] * ic_m)
         
-        # Dinamik Ağırlıklı Skor
-        score = (0.4 * z_df_comp.iloc[-1] * cfg['signs'][0] +
-                 0.3 * z_liq.iloc[-1] * cfg['signs'][1] +
-                 0.3 * z_spr.iloc[-1] * cfg['signs'][2])
+        w = np.array(weights) / sum(weights)
+        w = np.clip(w, 0.15, 0.60)
+        w = w / sum(w)
         
-        # Gatekeeper
+        # Skor
+        m_skor = (w[0] * z_df_comp.iloc[-1] * cfg['signs'][0] +
+                  w[1] * z_liq.iloc[-1] * cfg['signs'][1] +
+                  w[2] * z_spr.iloc[-1] * cfg['signs'][2])
+        
+        # Momentum Gatekeeper
+        ret = df[name].pct_change().iloc[-1]
+        v_z = z(df[cfg['vol']]).iloc[-1]
         m_adj = 0.0
-        if daily_ret > 0.005 and vol_z < 0.2: m_adj = 0.70
-        elif daily_ret < -0.004 or vol_z > 1.2: m_adj = -0.70
-        
-        res[name] = {'final': score + m_adj, 'ret': daily_ret}
-    return res
-
-# 4. UYGULAMA AKIŞI
-data = fetch_data()
-
-if not data.empty:
-    analysis = run_analysis(data)
-    
-    # Makro Panel
-    st.success(f"Veri Güncelliği: {data.index[-1].date()}")
-    c1, c2, c3 = st.columns(3)
-    c1.metric("VIX", f"{data['VIX'].iloc[-1]:.2f}")
-    c2.metric("DXY", f"{data['DXY'].iloc[-1]:.2f}")
-    c3.metric("10Y Reel", f"%{data['REEL_FAIZ'].iloc[-1]:.2f}")
-
-    st.markdown("---")
-
-    # Varlıklar
-    cols = st.columns(2)
-    for i, (name, vals) in enumerate(analysis
+        gk = "NEUTRAL"
+        if ret > 0.005 and v_z < 0.2:
+            gk, m_adj = "CONFIRMED_BULLISH", 0.75
+        elif ret < -0.004 or v_z > 1.2:
+            gk

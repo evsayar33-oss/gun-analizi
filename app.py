@@ -4,110 +4,102 @@ import numpy as np
 import yfinance as yf
 from datetime import datetime
 
-# 1. AYARLAR VE TASARIM
-st.set_page_config(page_title="Macro Matrix Pro + OOS", layout="wide")
-st.markdown("""
-    <style>
-    .main { background-color: #0d1117; color: white; }
-    .card { border: 1px solid #333; padding: 15px; border-radius: 12px; background: #161b22; margin-bottom: 15px; }
-    .hit-rate-badge {
-        padding: 15px; border-radius: 10px; text-align: center; font-weight: bold; margin-bottom: 20px;
-        border: 2px solid;
-    }
-    </style>
-    """, unsafe_allow_html=True)
+# 1. AYARLAR
+st.set_page_config(page_title="Macro Matrix Pro", layout="wide")
+st.markdown("<style>.main { background-color: #0d1117; color: white; }</style>", unsafe_allow_html=True)
 
-# 2. VERİ ÇEKME
+# 2. VERİ MOTORU
 @st.cache_data(ttl=120)
-def get_pro_data():
-    syms = {
-        'SPX': 'ES=F', 'NDX': 'NQ=F', 'XAU': 'GC=F', 'XAG': 'SI=F', 
-        'DXY': 'DX-Y.NYB', 'TNX': '^TNX', 'VIX': '^VIX', 'HYG': 'HYG'
-    }
+def get_data():
+    # Vadeli semboller: ES=F (S&P), NQ=F (Nasdaq), GC=F (Altın), SI=F (Gümüş)
+    syms = {'SPX':'ES=F', 'NDX':'NQ=F', 'XAU':'GC=F', 'XAG':'SI=F', 'DXY':'DX-Y.NYB', 'TNX':'^TNX', 'VIX':'^VIX', 'HYG':'HYG'}
     df_d = yf.download(list(syms.values()), period="1y", interval="1d")['Close'].ffill()
     df_d = df_d.rename(columns={v: k for k, v in syms.items()})
     df_h = yf.download(list(syms.values()), period="5d", interval="1h")['Close'].ffill()
     df_h = df_h.rename(columns={v: k for k, v in syms.items()})
     return df_d, df_h
 
-# 3. OOS HIT-RATE HESAPLAMA (DETERMİNİSTİK)
-def calculate_oos_hit_rate(df):
-    # Makro sinyali geçmişte ne kadar haklıydı? (Son 60 gün test edilir)
+# 3. OOS HIT-RATE HESAPLAMA
+def calc_hit_rate(df):
     def z(s): return (s - s.rolling(126).mean()) / s.rolling(126).std()
-    
-    z_comp = (z(df['TNX'] - 2.1) + z(df['DXY'])) / 2
-    # Basitleştirilmiş makro sinyal geçmişi
-    # Sign: -1 * z_comp (Dolar/Faiz arttıkça borsa düşer mantığı)
-    past_signals = -z_comp.shift(5) # 5 gün önceki sinyal
-    fwd_returns = df['SPX'].pct_change(5) # 5 gün sonraki gerçek getiri
-    
-    # Sinyal ile getirinin yönü aynı mı?
-    hits = (np.sign(past_signals) == np.sign(fwd_returns)).tail(60)
-    hit_rate = hits.mean() * 100
-    return hit_rate
+    # 5 gün önceki makro sinyal vs 5 gün sonraki getiri
+    z_c = (z(df['TNX'] - 2.1) + z(df['DXY'])) / 2
+    past_sig = -z_c.shift(5)
+    fwd_ret = df['SPX'].pct_change(5)
+    hits = (np.sign(past_sig) == np.sign(fwd_ret)).tail(60)
+    return hits.mean() * 100
 
-# 4. ANALİZ MOTORU
-def run_engine():
-    df_d, df_h = get_pro_data()
-    hit_rate = calculate_oos_hit_rate(df_d)
-    
-    def z(s): return (s - s.rolling(126).mean()) / s.rolling(126).std()
-    z_comp = (z(df_d['TNX'] - 2.1) + z(df_d['DXY'])) / 2
-    z_liq = -z(df_d['TNX'])
-    z_spr = z(100 - df_d['HYG'])
-
-    assets = {'SPX':[-1,1,-1], 'NDX':[-1,1,-1], 'XAU':[-1,1,1], 'XAG':[-1,1,-1]}
-    res = {}
-    
-    for name, signs in assets.items():
-        m_skor = (0.4 * z_comp.iloc[-1] * signs[0]) + (0.3 * z_liq.iloc[-1] * signs[1]) + (0.3 * z_spr.iloc[-1] * signs[2])
-        v_4h = (df_h[name].iloc[-1] / df_h[name].iloc[-5]) - 1
-        
-        if v_4h > 0.001:
-            pulse, sig = "YUKARI", ("GÜÇLÜ TREND" if m_skor > 0 else "MAKROYA DİRENEN YÜKSELİŞ")
-        elif v_4h < -0.001:
-            pulse, sig = "AŞAĞI", ("GÜÇLÜ SATIŞ" if m_skor < 0 else "BOĞA DÜZELTMESİ")
-        else:
-            pulse, sig = "YATAY", "KARARSIZ BÖLGE"
-
-        res[name] = {'m_skor': m_skor, 'v_4h': v_4h*100, 'pulse': pulse, 'sig': sig, 'price': df_h[name].iloc[-1]}
-        
-    return res, df_d, hit_rate
-
-# 5. UI
+# 4. MOTORU ÇALIŞTIR
 try:
-    results, df_d, hr = run_engine()
-    st.title("🏛️ MACRO MATRIX PRO")
+    df_d, df_h = get_data()
+    hr = calc_hit_rate(df_d)
+    
+    st.title("🏛️ MACRO MATRIX TERMINAL")
 
     # --- OOS HIT-RATE ROZETİ ---
     if hr >= 60:
-        hr_color, hr_bg, hr_txt = "#00ff00", "rgba(0,255,0,0.1)", "YEŞİL (ABD/Dolar Mantığı Kusursuz Çalışıyor)"
+        h_c, h_t = "#00ff00", "YEŞİL (ABD/Dolar Mantığı Kusursuz)"
     elif hr >= 45:
-        hr_color, hr_bg, hr_txt = "#ffff00", "rgba(255,255,0,0.1)", "SARI (Verim Düşüyor, Piyasa Rejim Değiştiriyor)"
+        h_c, h_t = "#ffff00", "SARI (Verim Düşüyor, Rejim Değişiyor)"
     else:
-        hr_color, hr_bg, hr_txt = "#ff4b4b", "rgba(255,75,75,0.1)", "KIRMIZI (PARADİGMA KAYMASI! Çapaları Güncelle)"
+        h_c, h_t = "#ff4b4b", "KIRMIZI (PARADİGMA KAYMASI! Güncelle)"
 
     st.markdown(f"""
-        <div class="hit-rate-badge" style="background-color:{hr_bg}; border-color:{hr_color}; color:{hr_color};">
-            <small>OOS HIT-RATE GÜVEN ROZETİ</small><br>
-            <span style="font-size:24px;">%{hr:.1f}</span><br>
-            <span>{hr_txt}</span>
+        <div style="border: 2px solid {h_c}; padding:10px; border-radius:10px; text-align:center; background:rgba(0,0,0,0.2);">
+            <small style="color:{h_c}">OOS HIT-RATE GÜVEN ROZETİ</small><br>
+            <b style="font-size:24px; color:{h_c}">%{hr:.1f}</b><br>
+            <span style="color:{h_c}; font-size:12px;">{h_t}</span>
         </div>
     """, unsafe_allow_html=True)
 
-    # Üst Bilgi
-    m1, m2, m3 = st.columns(3)
-    m1.metric("10Y Reel", f"%{df_d['TNX'].iloc[-1]-2.1:.2f}")
-    m2.metric("DXY", f"{df_d['DXY'].iloc[-1]:.2f}")
-    m3.metric("Kredi Spread", f"{100-df_d['HYG'].iloc[-1]:.2f}")
+    # Üst Göstergeler
+    st.write("---")
+    def z_val(s): return (s - s.rolling(126).mean()) / s.rolling(126).std()
+    z_comp = (z_val(df_d['TNX'] - 2.1) + z_val(df_d['DXY'])) / 2
+    z_liq = -z_val(df_d['TNX'])
+    z_spr = z_val(100 - df_d['HYG'])
 
-    st.divider()
+    c1, c2, c3 = st.columns(3)
+    c1.metric("10Y Reel", f"%{df_d['TNX'].iloc[-1]-2.1:.2f}")
+    c2.metric("DXY", f"{df_d['DXY'].iloc[-1]:.2f}")
+    c3.metric("VIX", f"{df_d['VIX'].iloc[-1]:.2f}")
 
-    for name, v in results.items():
-        p_clr = "#00ff00" if v['v_4h'] > 0 else "#ff4b4b"
-        m_clr = "green" if v['m_skor'] > 0 else "red"
+    # Varlıklar
+    assets = {'SPX':[-1,1,-1], 'NDX':[-1,1,-1], 'XAU':[-1,1,1], 'XAG':[-1,1,-1]}
+    
+    for name, signs in assets.items():
+        # Dinamik Altın Rejimi
+        spr_sign = signs[2]
+        if name == 'XAU' and z_val(df_d['VIX']).iloc[-1] > 2.0:
+            spr_sign = -1
+            
+        m_skor = (0.4 * z_comp.iloc[-1] * signs[0]) + (0.3 * z_liq.iloc[-1] * signs[1]) + (0.3 * z_spr.iloc[-1] * spr_sign)
+        v_4h = ((df_h[name].iloc[-1] / df_h[name].iloc[-5]) - 1) * 100
+        
+        p_clr = "#00ff00" if v_4h > 0 else "#ff4b4b"
+        m_clr = "green" if m_skor > 0 else "red"
+        
+        # Durum Mesajı
+        if v_4h > 0.15:
+            msg = "GÜÇLÜ TREND" if m_skor > 0 else "MAKROYA DİRENEN YÜKSELİŞ"
+        elif v_4h < -0.15:
+            msg = "GÜÇLÜ SATIŞ" if m_skor < 0 else "BOĞA DÜZELTMESİ"
+        else:
+            msg = "KARARSIZ / BEKLE"
+
         st.markdown(f"""
-        <div class="card">
-            <div style="display:flex; justify-content:space-between;">
-                <h2 style="margin:0;">{name}</h2>
-                <h2 style="margin:0; color:{p_clr};">%{v['v_4h']:.2f}</h2>
+            <div style="border:1px solid #333; padding:15px; border-radius:10px; margin-bottom:10px; background:#161b22;">
+                <div style="display:flex; justify-content:space-between;">
+                    <b>{name}</b> <b style="color:{p_clr}">%{v_4h:.2f}</b>
+                </div>
+                <div style="font-size:12px; margin:5px 0;">
+                    Fiyat: {df_h[name].iloc[-1]:.2f} | Makro: <span style="color:{m_clr}">{'BOĞA' if m_skor>0 else 'AYI'}</span>
+                </div>
+                <div style="background:#0d1117; padding:8px; border-radius:5px; border-left:4px solid {p_clr}; font-size:14px;">
+                    {msg}
+                </div>
+            </div>
+        """, unsafe_allow_html=True)
+
+except Exception as e:
+    st.error(f"Hata: {e}")

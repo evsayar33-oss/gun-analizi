@@ -7,35 +7,34 @@ import requests
 from streamlit_autorefresh import st_autorefresh
 
 # --- 0. OTOMATİK YENİLEME ---
-st_autorefresh(interval=3600 * 1000, key="macro_final_fix_v5")
+st_autorefresh(interval=3600 * 1000, key="macro_force_final_v6")
 
-st.set_page_config(page_title="Macro Force Pro V5", layout="wide")
+st.set_page_config(page_title="Macro Force Final Terminal", layout="wide")
 
 st.markdown("""
     <style>
     .main { background-color: #0d1117; color: white; }
     .card { padding: 18px; border-radius: 12px; margin-bottom: 15px; border-left: 8px solid; background: #161b22; }
-    .trend { border-left-color: #00ff00; }
-    .diverjanz { border-left-color: #ffcc00; }
-    .zayif { border-left-color: #ff4b4b; }
+    .trend { border-left-color: #00ff00; background-color: rgba(0, 255, 0, 0.05); }
+    .diverjanz { border-left-color: #ffcc00; background-color: rgba(255, 204, 0, 0.05); }
+    .zayif { border-left-color: #ff4b4b; background-color: rgba(255, 75, 75, 0.05); }
     .hit-rate-badge { border: 2px solid; padding: 15px; border-radius: 10px; text-align: center; background: rgba(0,0,0,0.2); margin-bottom: 20px; }
     </style>
     """, unsafe_allow_html=True)
 
 FRED_API_KEY = st.secrets.get("FRED_API_KEY", None)
 
-# --- 1. VERİ MOTORU ---
+# --- 1. VERİ MOTORU (GÜNLÜK HACİM ODAKLI) ---
 @st.cache_data(ttl=300)
-def get_v5_data(api_key):
-    # Stabilite için 3 yıllık veri
+def get_final_data(api_key):
     syms = {'SPX':'ES=F', 'NDX':'NQ=F', 'XAU':'GC=F', 'XAG':'SI=F', 'DXY':'DX-Y.NYB', 'TNX':'^TNX', 'VIX':'^VIX', 'HYG':'HYG'}
-    df_y = yf.download(list(syms.values()), period="3y", interval="1d")['Close'].ffill()
-    df_y = df_y.rename(columns={v: k for k, v in syms.items()})
+    # Günlük veride Close ve Volume beraber çekiliyor
+    df_y_raw = yf.download(list(syms.values()), period="3y", interval="1d")
+    df_y = df_y_raw['Close'].ffill().rename(columns={v: k for k, v in syms.items()})
+    df_v_daily = df_y_raw['Volume'].ffill().rename(columns={v: k for k, v in syms.items()})
     
-    # Hacim ve İvme için Saatlik Veri
-    h_raw = yf.download(['ES=F', 'NQ=F', 'GC=F', 'SI=F'], period="7d", interval="1h")
-    df_h = h_raw['Close'].rename(columns={'ES=F':'SPX', 'NQ=F':'NDX', 'GC=F':'XAU', 'SI=F':'XAG'}).ffill()
-    df_v = h_raw['Volume'].rename(columns={'ES=F':'SPX', 'NQ=F':'NDX', 'GC=F':'XAU', 'SI=F':'XAG'}).ffill()
+    # İvme için saatlik Close (Hacim kullanılmayacak)
+    df_h = yf.download(['ES=F', 'NQ=F', 'GC=F', 'SI=F'], period="7d", interval="1h")['Close'].rename(columns={'ES=F':'SPX', 'NQ=F':'NDX', 'GC=F':'XAU', 'SI=F':'XAG'}).ffill()
 
     # FRED Verileri
     df_f = pd.DataFrame(index=df_y.index)
@@ -50,16 +49,16 @@ def get_v5_data(api_key):
                 obs['date'] = pd.to_datetime(obs['date'])
                 df_f[name] = obs.set_index('date')['value'].reindex(df_y.index, method='ffill')
             except: pass
-    return df_y, df_h, df_v, df_f.ffill()
+    return df_y, df_v_daily, df_h, df_f.ffill()
 
 def z_roll(s, win=126):
-    return (s - s.rolling(win, min_periods=1).mean()) / s.rolling(win, min_periods=1).std()
+    return (s - s.rolling(win, min_periods=20).mean()) / s.rolling(win, min_periods=20).std()
 
-# --- 2. HESAPLAMA VE KALİBRASYON ---
+# --- 2. HESAPLAMA ---
 try:
-    df_y, df_h, df_v, df_f = get_v5_data(FRED_API_KEY)
+    df_y, df_v, df_h, df_f = get_final_data(FRED_API_KEY)
     
-    # Faktörler
+    # Makro Değişkenler
     breakeven = df_f['T10YIE'] if 'T10YIE' in df_f.columns else 2.1
     reel_faiz = df_y['TNX'] - breakeven
     
@@ -68,63 +67,61 @@ try:
     z_liq = z_roll(df_f['WALCL']) if 'WALCL' in df_f.columns else -z_roll(df_y['TNX'])
     z_spr = z_roll(df_f['SPREAD']) if 'SPREAD' in df_f.columns else z_roll(100 - df_y['HYG'])
 
-    # --- OOS HIT-RATE DÜZELTME (SIGN FLIP CHECK) ---
-    # Fiyatla pozitif korelasyonlu bir sinyal serisi oluşturuyoruz
-    # (Likidite +1) + (Faiz -1) + (Dolar -1) + (Spread -1)
-    signal_series = (0.3 * z_liq) + (0.4 * -(z_rf + z_dxy)/2) + (0.3 * -z_spr)
+    # --- HIT-RATE DÜZELTME ---
+    # Sinyal: (Likidite +1) + (Faiz/Dolar -1) + (Spread -1)
+    # df_y indexi ile hizalanmış temiz seri
+    macro_signal = (0.3 * z_liq.fillna(0)) + (0.4 * -(z_rf.fillna(0) + z_dxy.fillna(0))/2) + (0.3 * -z_spr.fillna(0))
     
-    prediction = signal_series.shift(5)
-    actual_return = df_y['SPX'].pct_change(5)
+    # Tahmin: Dünkü sinyal bugün ne yaptı?
+    prediction = macro_signal.shift(1)
+    actual_move = df_y['SPX'].pct_change(1)
     
-    # Başarı oranı (Son 126 gün)
-    hits = (np.sign(prediction) == np.sign(actual_return)).tail(126)
+    # Başarı oranı (Son 60 işlem günü - daha hassas)
+    hits = (np.sign(prediction) == np.sign(actual_move)).tail(60)
     hr = float(hits.mean() * 100)
 
-    # --- UI BAŞLIĞI ---
-    st.title("🏛️ MACRO FORCE TERMINAL PRO")
+    # --- UI ---
+    st.title("🏛️ MACRO FORCE FINAL TERMINAL")
     
-    h_c = "#00ff00" if hr >= 55 else "#ffff00" if hr >= 40 else "#ff4b4b"
+    h_c = "#00ff00" if hr >= 52 else "#ffff00" if hr >= 42 else "#ff4b4b"
     st.markdown(f"""
         <div class="hit-rate-badge" style="border-color:{h_c}; color:{h_c};">
-            <small>OOS HIT-RATE (GÜVEN ENDEKSİ)</small><br>
-            <b style="font-size:32px;">%{hr:.1f}</b><br>
-            <span>{'UYUMLU REJİM' if hr >= 55 else 'PİYASA KARARSIZ' if hr >= 40 else 'TERS REJİM / DİKKAT'}</span>
+            <small>OOS HIT-RATE GÜVEN ENDEKSİ</small><br>
+            <b style="font-size:32px;">%{hr:.1f}</b>
         </div>
     """, unsafe_allow_html=True)
 
-    # METRIKLER
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Reel Faiz", f"%{reel_faiz.iloc[-1]:.2f}", f"{z_rf.iloc[-1]:.2f}z")
     c2.metric("DXY", f"{df_y['DXY'].iloc[-1]:.2f}", f"{z_dxy.iloc[-1]:.2f}z")
-    liq_t = float(df_f['WALCL'].iloc[-1]/1000000) if 'WALCL' in df_f.columns else 0
-    c3.metric("Likidite", f"{liq_t:.2f}T", f"{z_liq.iloc[-1]:.2f}z")
-    spr_v = float(df_f['SPREAD'].iloc[-1]) if 'SPREAD' in df_f.columns else 0
-    c4.metric("Kredi Spread", f"%{spr_v:.2f}", f"{z_spr.iloc[-1]:.2f}z")
+    liq_val = float(df_f['WALCL'].iloc[-1]/1000000) if 'WALCL' in df_f.columns else 0
+    c3.metric("Likidite", f"{liq_val:.2f}T", f"{z_liq.iloc[-1]:.2f}z")
+    spr_val = float(df_f['SPREAD'].iloc[-1]) if 'SPREAD' in df_f.columns else 0
+    c4.metric("Kredi Spread", f"%{spr_val:.2f}", f"{z_spr.iloc[-1]:.2f}z")
 
     st.divider()
 
-    # VARLIK KARTLARI
+    # VARLIKLAR
+    # signs: [DolarFaiz, Likidite, Spread]
     assets = {'SPX':[-1,1,-1], 'NDX':[-1,1,-1], 'XAU':[-1,1,1], 'XAG':[-1,1,-1]}
     cols = st.columns(2)
     
     for i, (name, signs) in enumerate(assets.items()):
-        # Makro Skor
+        # Makro Skor (Damped)
         m_skor = float((0.4 * -(z_rf + z_dxy).iloc[-1]/2) + (0.3 * z_liq.iloc[-1] * signs[1]) + (0.3 * z_spr.iloc[-1] * signs[2]))
         
-        # --- HACİM VE İVME KALİBRASYONU ---
-        p_now, p_prev = df_h[name].iloc[-1], df_h[name].iloc[-5] # 4 Saatlik
-        v_now = df_v[name].iloc[-1]
-        v_avg_24 = df_v[name].rolling(24).mean().iloc[-1]
+        # --- GÜNLÜK HACİM İVMESİ ---
+        v_now = df_v[name].iloc[-1] # Bugünkü hacim
+        v_avg_20 = df_v[name].rolling(20).mean().iloc[-2] # Son 20 gün ortalaması (Bugün hariç)
+        vol_accel = v_now / v_avg_20 if v_avg_20 > 0 else 0
         
-        # Hacim Z-Skoru yerine "Hacim İvmesi" (Current vs 24h Avg)
-        # Eğer hacim 24 saatlik ortalamanın %80'inden fazlaysa onaylı kabul et
-        vol_accel = v_now / v_avg_24 if v_avg_24 > 0 else 0
+        # Fiyat İvmesi (Son 4 Saatlik)
+        roc = ((df_h[name].iloc[-1] / df_h[name].iloc[-5]) - 1) * 100
         
-        roc = ((p_now / p_prev) - 1) * 100
-        
-        # MOMENTUM KARAR (Daha esnek hacim eşiği)
-        if abs(roc) > 0.05:
-            if vol_accel > 0.75: # Hacim makul seviyedeyse
+        # KARAR MANTIĞI
+        # Hacim ivmesi 0.4x üzerindeyse (günün yarısı bile geçse makuldür) onaylı say
+        if abs(roc) > 0.03:
+            if vol_accel > 0.45: 
                 mom_dir = np.sign(roc)
                 mom_label = "HACİMLİ"
             else:
@@ -134,7 +131,7 @@ try:
             mom_dir = 0
             mom_label = "YATAY"
 
-        # DİNAMİK RENK VE DURUM
+        # DİNAMİK DURUM
         is_div = (np.sign(m_skor) != mom_dir) and (mom_dir != 0)
         
         if is_div:
@@ -151,17 +148,17 @@ try:
             st.markdown(f"""
             <div class="card {cls}">
                 <div style="display:flex; justify-content:space-between;">
-                    <b style="font-size:20px;">{name}</b>
-                    <b style="color:{p_clr}; font-size:18px;">%{roc:.2f}</b>
+                    <b style="font-size:22px;">{name}</b>
+                    <b style="color:{p_clr}; font-size:20px;">%{roc:.2f}</b>
                 </div>
                 <p style="margin:5px 0; font-size:14px; color:#ccc;">
                     Makro: {m_skor:.2f} | Hacim İvme: {vol_accel:.2f}x ({mom_label})
                 </p>
-                <div style="background:rgba(0,0,0,0.3); padding:8px; border-radius:5px; margin-top:5px;">
-                    <b style="color:{clr}; font-size:17px;">{sig} - {lbl}</b>
+                <div style="background:rgba(0,0,0,0.3); padding:10px; border-radius:8px; margin-top:8px;">
+                    <b style="color:{clr}; font-size:18px;">{sig} - {lbl}</b>
                 </div>
             </div>
             """, unsafe_allow_html=True)
 
 except Exception as e:
-    st.error(f"Kritik Hata: {e}")
+    st.error(f"Sistem Hatası: {e}")

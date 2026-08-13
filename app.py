@@ -7,10 +7,9 @@ import requests
 from streamlit_autorefresh import st_autorefresh
 
 # --- 0. OTOMATİK YENİLEME VE AYARLAR ---
-st_autorefresh(interval=3600 * 1000, key="macro_forced_direction_v8")
-st.set_page_config(page_title="Macro Directional Pro", layout="wide")
+st_autorefresh(interval=3600 * 1000, key="macro_differential_v9")
+st.set_page_config(page_title="Macro Quant Pro", layout="wide")
 
-# CSS: Canlı ve Agresif Kart Tasarımı
 st.markdown("""
     <style>
     .main { background-color: #05070a; color: white; }
@@ -25,15 +24,14 @@ st.markdown("""
 
 FRED_API_KEY = st.secrets.get("FRED_API_KEY", None)
 
-# --- 1. VERİ MİMARİSİ ---
 @st.cache_data(ttl=300)
-def get_v8_data(api_key):
+def get_v9_data(api_key):
     syms = {'SPX':'ES=F', 'NDX':'NQ=F', 'XAU':'GC=F', 'XAG':'SI=F', 'DXY':'DX-Y.NYB', 'TNX':'^TNX', 'VIX':'^VIX', 'VXN':'^VXN', 'HYG':'HYG'}
     df_y = yf.download(list(syms.values()), period="4y", interval="1d")['Close'].ffill().rename(columns={v: k for k, v in syms.items()})
-    
     h_raw = yf.download(['ES=F', 'NQ=F', 'GC=F', 'SI=F'], period="7d", interval="1h")
     df_h = h_raw['Close'].rename(columns={'ES=F':'SPX', 'NQ=F':'NDX', 'GC=F':'XAU', 'SI=F':'XAG'}).ffill()
-    
+    df_v = h_raw['Volume'].rename(columns={'ES=F':'SPX', 'NQ=F':'NDX', 'GC=F':'XAU', 'SI=F':'XAG'}).ffill()
+
     df_f = pd.DataFrame(index=df_y.index)
     if api_key:
         fred_ids = {'WALCL': 'WALCL', 'TGA': 'WTREGEN', 'RRP': 'RRPONTSYD', 'T10YIE': 'T10YIE', 'SPREAD': 'BAMLH0A0HYM2'}
@@ -46,15 +44,14 @@ def get_v8_data(api_key):
                 obs['date'] = pd.to_datetime(obs['date'])
                 df_f[name] = obs.set_index('date')['value'].reindex(df_y.index, method='ffill')
             except: pass
-    return df_y, df_h, df_f.ffill()
+    return df_y, df_h, df_v, df_f.ffill()
 
-def z_roll(s, win=126): return (s - s.rolling(win, min_periods=1).mean()) / (s.rolling(win, min_periods=1).std() + 1e-9)
+def z_roll(s, win=126): return (s - s.rolling(win, min_periods=20).mean()) / (s.rolling(win, min_periods=20).std() + 1e-9)
 
-# --- 2. DİNAMİK REJİM MOTORU ---
+# --- ANALİZ MOTORU ---
 try:
-    df_y, df_h, df_f = get_v8_data(FRED_API_KEY)
+    df_y, df_h, df_v, df_f = get_v9_data(FRED_API_KEY)
     
-    # Faktör Hazırlığı
     breakeven = df_f['T10YIE'] if 'T10YIE' in df_f.columns else 2.1
     reel_faiz = df_y['TNX'] - breakeven
     z_rf, z_dxy = z_roll(reel_faiz), z_roll(df_y['DXY'])
@@ -62,23 +59,12 @@ try:
     z_liq = z_roll(net_liq)
     z_spr = z_roll(df_f['SPREAD']) if 'SPREAD' in df_f.columns else z_roll(100 - df_y['HYG'])
     
-    # --- REJİM ADAPTÖRÜ (DİNAMİK AĞIRLIKLANDIRMA) ---
+    # REJİM BELİRLEME
     vix_now = df_y['VIX'].iloc[-1]
-    spr_now = z_spr.iloc[-1]
-    
-    # Default Ağırlıklar (DF: 0.40, LIQ: 0.30, SPR: 0.30)
-    # Kriz durumunda Spread ve Likiditeye kaç
-    if vix_now > 25 or spr_now > 1.5:
-        base_w = [0.20, 0.40, 0.40] # Kriz Rejimi
-        regime_label = "KRİZ / DEFANSİF"
-    elif vix_now < 15 and z_dxy.iloc[-1] < 0:
-        base_w = [0.50, 0.30, 0.20] # Genişleme Rejimi
-        regime_label = "RİSK-ON / AGRESİF"
-    else:
-        base_w = [0.40, 0.30, 0.30] # Normal Rejim
-        regime_label = "STABİL / DENGELİ"
+    if vix_now > 22: base_w, r_label = [0.2, 0.4, 0.4], "KRİZ / DEFANSİF"
+    elif vix_now < 14: base_w, r_label = [0.5, 0.3, 0.2], "EXPANSION / AGRESİF"
+    else: base_w, r_label = [0.4, 0.3, 0.3], "STABİL / DENGELİ"
 
-    # --- VARLIK ANALİZİ ---
     assets = {
         'SPX': {'signs': [-1, 1, -1], 'vol': 'VIX'},
         'NDX': {'signs': [-1, 1, -1], 'vol': 'VXN'},
@@ -88,58 +74,44 @@ try:
     
     results = {}
     for name, cfg in assets.items():
-        # Damped IC Ağırlıklandırma
+        # 1. MAKRO BİLEŞEN (Dış Dünya)
         fwd_ret = df_y[name].pct_change(5).shift(-5)
         factors = [(z_rf + z_dxy)/2, z_liq, z_spr]
-        
-        final_weights = []
+        weights = []
         for i, f_z in enumerate(factors):
             ic = f_z.rolling(126).corr(fwd_ret).iloc[-1]
-            if np.isnan(ic): ic = 0
-            # Sönümleme ve Clamp
-            ham_w = base_w[i] * np.clip(1 + (ic * cfg['signs'][i]), 0.5, 1.5)
-            final_weights.append(ham_w)
+            weights.append(base_w[i] * np.clip(1 + (ic * cfg['signs'][i]), 0.6, 1.4))
+        w = np.array(weights) / sum(weights)
         
-        w = np.array(final_weights) / sum(final_weights)
-        
-        # Altın Özel Akut Likidasyon
-        spr_sign = cfg['signs'][2]
-        if name == 'XAU' and vix_now > 30: spr_sign = -1
+        m_env = (w[0] * (z_rf.iloc[-1] + z_dxy.iloc[-1])/2 * -1 + 
+                 w[1] * z_liq.iloc[-1] * 1 + 
+                 w[2] * z_spr.iloc[-1] * cfg['signs'][2])
 
-        # Ham Makro Skor
-        m_skor = (w[0] * (z_rf.iloc[-1] + z_dxy.iloc[-1])/2 * -1 + 
-                  w[1] * z_liq.iloc[-1] * 1 + 
-                  w[2] * z_spr.iloc[-1] * spr_sign)
+        # 2. VARLIK ÖZGÜN BİLEŞENİ (Diferansiyel Düzeltme)
+        # Varlığın kendi 200 günlük fiyat Z-skoru (Ters işaret: Çok yükselen pahalıdır/sat)
+        z_self = z_roll(df_y[name], win=200).iloc[-1] * -1 
 
-        # Momentum Gatekeeper
+        # 3. FUNDAMENTAL SKOR (Makro %70 + Özgün Valüasyon %30)
+        fundamental_skor = (m_env * 0.7) + (z_self * 0.3)
+
+        # 4. MOMENTUM (Hacim Z-Skoru Destekli)
+        last_v = df_v[name].tail(24)
+        v_z = (df_v[name].iloc[-1] - last_v.mean()) / (last_v.std() + 1e-9)
         roc_4h = ((df_h[name].iloc[-1] / df_h[name].iloc[-5]) - 1) * 100
-        
-        # NİHAİ YÖNÜ ZORLA (Binary + Intensity)
-        # Nötr bölge yok; skor 0'ın üzerindeyse AL, altındaysa SAT.
-        total_power = m_skor + (roc_4h / 5) # Momentumu skora %20 ekle
-        
-        if total_power > 1.0: status = "GÜÇLÜ_AL"
-        elif total_power > 0: status = "DİKKATLİ_AL"
-        elif total_power > -1.0: status = "DİKKATLİ_SAT"
+        mom_power = (roc_4h / 5) if v_z > -0.2 else 0
+
+        # NİHAİ SKOR (Nötr Yasak)
+        total_score = fundamental_skor + mom_power
+        if total_score > 0.8: status = "GÜÇLÜ_AL"
+        elif total_score > 0: status = "DİKKATLİ_AL"
+        elif total_score > -0.8: status = "DİKKATLİ_SAT"
         else: status = "GÜÇLÜ_SAT"
             
-        results[name] = {'score': total_power, 'm_skor': m_skor, 'roc': roc_4h, 'status': status, 'weights': w}
+        results[name] = {'score': total_score, 'm_env': m_env, 'z_self': z_self, 'status': status, 'v_z': v_z, 'roc': roc_4h}
 
-    # --- OOS HIT-RATE ---
-    prediction = ((z_liq * 0.4) + (-(z_rf + z_dxy)/2 * 0.4)).shift(2)
-    hits = (np.sign(prediction) == np.sign(df_y['SPX'].pct_change(2))).tail(126)
-    hr = float(hits.mean() * 100)
-
-    # --- UI ---
-    st.title("🏛️ MACRO FORCED-DIRECTION TERMINAL")
-    
-    h_c = "#00ff00" if hr >= 55 else "#ffff00" if hr >= 45 else "#ff4b4b"
-    st.markdown(f"""
-        <div class="hit-rate-badge" style="border-color:{h_c}; color:{h_c};">
-            <small>MODEL GÜVEN ROZETİ (OOS %{hr:.1f})</small><br>
-            <span style="font-size:20px;">REJİM: <b>{regime_label}</b></span>
-        </div>
-    """, unsafe_allow_html=True)
+    # UI
+    st.title("🏛️ MACRO QUANT DIFFERENTIAL")
+    st.markdown(f'<div class="hit-rate-badge" style="border-color:#58a6ff; color:#58a6ff;"><small>PİYASA REJİMİ</small><br><b style="font-size:24px;">{r_label}</b></div>', unsafe_allow_html=True)
 
     cols = st.columns(2)
     for i, (name, data) in enumerate(results.items()):
@@ -147,22 +119,19 @@ try:
         with cols[i%2]:
             st.markdown(f"""
             <div class="card status-{data['status']}">
-                <div style="display:flex; justify-content:space-between;">
-                    <b style="font-size:28px;">{name}</b>
-                    <b style="font-size:24px;">{s_label}</b>
+                <div style="display:flex; justify-content:space-between; align-items:center;">
+                    <b style="font-size:32px;">{name}</b>
+                    <b style="font-size:22px;">{s_label}</b>
                 </div>
                 <hr style="border:0.1px solid rgba(255,255,255,0.1); margin:15px 0;">
-                <p style="margin:5px 0; font-size:16px;">Sinyal Gücü: <b>{data['score']:.2f}</b></p>
-                <p style="margin:5px 0; font-size:14px; color:#aaa;">Makro Temel: {data['m_skor']:.2f} | 4s İvme: %{data['roc']:.2f}</p>
-                <small style="color:#555;">Dinamik Ağırlıklar: %{int(data['weights'][0]*100)} / %{int(data['weights'][1]*100)} / %{int(data['weights'][2]*100)}</small>
+                <p style="margin:5px 0; font-size:18px;">Total Score: <b>{data['score']:.2f}</b></p>
+                <div style="font-size:13px; color:#aaa; line-height:1.6;">
+                    🌍 Makro Çevre: {data['m_env']:.2f}<br>
+                    💎 Özgün Değerleme: {data['z_self']:.2f}<br>
+                    📊 Hacim Gücü: {data['v_z']:.2f}z | 4s İvme: %{data['roc']:.2f}
+                </div>
             </div>
             """, unsafe_allow_html=True)
-
-    # MAKRO PANO
-    st.sidebar.markdown("### 📊 CANLI MAKRO VERİLER")
-    st.sidebar.write(f"10Y Reel Faiz: %{reel_faiz.iloc[-1]:.2f}")
-    st.sidebar.write(f"Net Likidite: {l_v if (l_v:=float(df_f['WALCL'].iloc[-1]/1000000)) else 0:.2f}T")
-    st.sidebar.write(f"Kredi Spread: %{float(df_f['SPREAD'].iloc[-1]) if 'SPREAD' in df_f.columns else 0:.2f}")
 
 except Exception as e:
     st.error(f"Sistem Hatası: {e}")

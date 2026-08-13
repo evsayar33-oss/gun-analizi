@@ -7,8 +7,8 @@ import requests
 from streamlit_autorefresh import st_autorefresh
 
 # --- 0. OTOMATİK YENİLEME ---
-st_autorefresh(interval=1800 * 1000, key="macro_final_v16")
-st.set_page_config(page_title="Macro Force Alpha V16", layout="wide")
+st_autorefresh(interval=1800 * 1000, key="macro_final_fix_v17")
+st.set_page_config(page_title="Macro Alpha Sentinel V17", layout="wide")
 
 st.markdown("""
     <style>
@@ -25,17 +25,14 @@ FRED_API_KEY = st.secrets.get("FRED_API_KEY", None)
 
 # --- 1. VERİ MOTORU ---
 @st.cache_data(ttl=300)
-def fetch_v16_data(api_key):
+def fetch_v17_data(api_key):
     syms = {'SPX':'ES=F', 'NDX':'NQ=F', 'XAU':'GC=F', 'XAG':'SI=F', 'DXY':'DX-Y.NYB', 'TNX':'^TNX', 'VIX':'^VIX', 'HYG':'HYG'}
-    # 5 Yıllık Backfill (Z-skor stabilitesi için)
     df_raw = yf.download(list(syms.values()), period="5y", interval="1d")
     df_y = df_raw['Close'].ffill().rename(columns={v: k for k, v in syms.items()})
     df_v = df_raw['Volume'].ffill().rename(columns={v: k for k, v in syms.items()})
     
-    # 7 Günlük Saatlik Veri (İvme için)
     df_h = yf.download(['ES=F', 'NQ=F', 'GC=F', 'SI=F'], period="7d", interval="1h")['Close'].rename(columns={'ES=F':'SPX', 'NQ=F':'NDX', 'GC=F':'XAU', 'SI=F':'XAG'}).ffill()
 
-    # FRED Verileri
     df_f = pd.DataFrame(index=df_y.index)
     fred_ids = {'WALCL': 'WALCL', 'TGA': 'WTREGEN', 'RRP': 'RRPONTSYD', 'T10YIE': 'T10YIE', 'SPREAD': 'BAMLH0A0HYM2'}
     for name, s_id in fred_ids.items():
@@ -58,60 +55,42 @@ def fetch_v16_data(api_key):
 def z_score(s, win=126):
     return (s - s.rolling(win, min_periods=10).mean()) / (s.rolling(win, min_periods=10).std() + 1e-9)
 
-# --- 2. HESAPLAMA VE ANALİZ ---
+# --- 2. HESAPLAMA ---
 try:
-    df_y, df_v, df_h, df_f = fetch_v16_data(FRED_API_KEY)
+    df_y, df_v, df_h, df_f = fetch_v17_data(FRED_API_KEY)
     
-    # Likidite İvmesi (DÜZELTİLDİ: Sadece farka değil, trend değişimine bakıyor)
+    # Likidite İvmesi
     net_liq = df_f['WALCL'] - df_f.get('TGA', 0) - df_f.get('RRP', 0)
-    # Likiditenin 20 günlük ortalamasının 126 günlük standart sapmaya göre yeri (Gerçek İvme)
     z_liq_accel = z_score(net_liq.rolling(20).mean(), 126)
     
-    z_rf = z_score(df_y['TNX'] - df_f['T10YIE'])
+    # REEL FAİZ TANIMLAMASI (Hata burada giderildi)
+    reel_faiz = df_y['TNX'] - df_f['T10YIE']
+    z_rf = z_score(reel_faiz)
+    
     z_dxy = z_score(df_y['DXY'])
     z_spr = z_score(df_f['SPREAD'])
 
-    # --- HIT-RATE HESAPLAMA (GERİ GELDİ) ---
-    # Sinyal: Likidite(+) + Faiz/Dolar(-) + Spread(-)
+    # OOS HIT-RATE
     sig_series = (0.5 * z_liq_accel) + (0.25 * -(z_rf + z_dxy)/2) + (0.25 * -z_spr)
     prediction = sig_series.shift(2)
     actual_move = df_y['SPX'].pct_change(2)
     mask = ~prediction.isna() & ~actual_move.isna()
     hr = float((np.sign(prediction[mask]) == np.sign(actual_move[mask])).tail(60).mean() * 100)
 
-    # --- UI BAŞLIĞI ---
-    st.title("🏛️ ALPHA SENTINEL V16 - PRO")
+    # --- UI ---
+    st.title("🏛️ ALPHA SENTINEL V17 - FINAL")
     
     c_time = datetime.now().strftime('%H:%M:%S')
     h_c = "#00ff00" if hr >= 55 else "#ffff00" if hr >= 45 else "#ff4b4b"
-    
-    st.markdown(f"""
-        <div class="hit-rate-badge" style="border-color:{h_c}; color:{h_c};">
-            <small>MODEL GÜVEN ROZETİ (OOS %)</small><br>
-            <b style="font-size:32px;">%{hr:.1f}</b><br>
-            <span>🕒 SON GÜNCELLEME: {c_time}</span>
-        </div>
-    """, unsafe_allow_html=True)
+    st.markdown(f'<div class="hit-rate-badge" style="border-color:{h_c}; color:{h_c};"><small>MODEL GÜVENİ (OOS %)</small><br><b style="font-size:32px;">%{hr:.1f}</b><br><span>🕒 SON GÜNCELLEME: {c_time}</span></div>', unsafe_allow_html=True)
 
     assets = {'SPX':[-1,1,-1], 'NDX':[-1,1,-1], 'XAU':[-1,1,1], 'XAG':[-1,1,-1]}
     cols = st.columns(2)
     
     for i, (name, signs) in enumerate(assets.items()):
-        # 1. MAKRO SKOR (%40)
-        m_env = (0.50 * z_liq_accel.iloc[-1] + 
-                 0.30 * -(z_rf.iloc[-1] + z_dxy.iloc[-1])/2 + 
-                 0.20 * z_spr.iloc[-1] * signs[2])
-        
-        # 2. MOMENTUM (%60)
+        m_env = (0.50 * z_liq_accel.iloc[-1] + 0.30 * -(z_rf.iloc[-1] + z_dxy.iloc[-1])/2 + 0.20 * z_spr.iloc[-1] * signs[2])
         roc_4h = ((df_h[name].iloc[-1] / df_h[name].iloc[-5]) - 1) * 100
-        # Hacim Z-Skoru
-        v_now = df_v[name].iloc[-1]
-        v_z = (v_now - df_v[name].tail(20).mean()) / (df_v[name].tail(20).std() + 1e-9)
-        
-        # İvme Katsayısı: Fiyat gidiyorsa skoru yukarı it
         mom_impact = (roc_4h * 1.5) if roc_4h > 0 else (roc_4h)
-
-        # NİHAİ SKOR
         total_score = (m_env * 0.4) + (mom_impact * 0.6)
         
         if total_score > 0.4: signal, desc = "AL", "GÜÇLÜ TREND"

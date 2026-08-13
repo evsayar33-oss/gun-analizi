@@ -6,38 +6,36 @@ from datetime import datetime
 import requests
 from streamlit_autorefresh import st_autorefresh
 
-# --- 0. OTOMATİK YENİLEME (HER 1 SAAT) ---
-st_autorefresh(interval=3600 * 1000, key="macro_oos_zvol_timer")
+# --- 0. OTOMATİK YENİLEME ---
+st_autorefresh(interval=3600 * 1000, key="macro_final_fix_v5")
 
-st.set_page_config(page_title="Macro Force Pro Terminal", layout="wide")
+st.set_page_config(page_title="Macro Force Pro V5", layout="wide")
 
-# CSS: Gelişmiş Kart Tasarımı
 st.markdown("""
     <style>
     .main { background-color: #0d1117; color: white; }
-    .card { padding: 18px; border-radius: 12px; margin-bottom: 15px; border-left: 8px solid; }
-    .trend { border-left-color: #00ff00; background-color: rgba(0, 255, 0, 0.05); }
-    .diverjanz { border-left-color: #ffcc00; background-color: rgba(255, 204, 0, 0.05); }
-    .zayif { border-left-color: #ff4b4b; background-color: rgba(255, 75, 75, 0.05); }
-    .hit-rate-badge { border: 2px solid; padding: 10px; border-radius: 10px; text-align: center; background: rgba(0,0,0,0.2); margin-bottom: 20px; }
+    .card { padding: 18px; border-radius: 12px; margin-bottom: 15px; border-left: 8px solid; background: #161b22; }
+    .trend { border-left-color: #00ff00; }
+    .diverjanz { border-left-color: #ffcc00; }
+    .zayif { border-left-color: #ff4b4b; }
+    .hit-rate-badge { border: 2px solid; padding: 15px; border-radius: 10px; text-align: center; background: rgba(0,0,0,0.2); margin-bottom: 20px; }
     </style>
     """, unsafe_allow_html=True)
 
-# SECRETS
-fred_api_key = st.secrets.get("FRED_API_KEY", None)
+FRED_API_KEY = st.secrets.get("FRED_API_KEY", None)
 
 # --- 1. VERİ MOTORU ---
 @st.cache_data(ttl=300)
-def get_pro_engine_data(api_key):
-    # Yahoo Verileri
-    y_syms = {'SPX':'ES=F', 'NDX':'NQ=F', 'XAU':'GC=F', 'XAG':'SI=F', 'DXY':'DX-Y.NYB', 'TNX':'^TNX', 'VIX':'^VIX'}
-    df_y = yf.download(list(y_syms.values()), period="3y", interval="1d")['Close'].ffill()
-    df_y = df_y.rename(columns={v: k for k, v in y_syms.items()})
+def get_v5_data(api_key):
+    # Stabilite için 3 yıllık veri
+    syms = {'SPX':'ES=F', 'NDX':'NQ=F', 'XAU':'GC=F', 'XAG':'SI=F', 'DXY':'DX-Y.NYB', 'TNX':'^TNX', 'VIX':'^VIX', 'HYG':'HYG'}
+    df_y = yf.download(list(syms.values()), period="3y", interval="1d")['Close'].ffill()
+    df_y = df_y.rename(columns={v: k for k, v in syms.items()})
     
-    # Saatlik veride Close ve Volume çekimi
-    df_h_raw = yf.download(['ES=F', 'NQ=F', 'GC=F', 'SI=F'], period="7d", interval="1h")
-    df_h = df_h_raw['Close'].rename(columns={'ES=F':'SPX', 'NQ=F':'NDX', 'GC=F':'XAU', 'SI=F':'XAG'}).ffill()
-    df_v = df_h_raw['Volume'].rename(columns={'ES=F':'SPX', 'NQ=F':'NDX', 'GC=F':'XAU', 'SI=F':'XAG'}).ffill()
+    # Hacim ve İvme için Saatlik Veri
+    h_raw = yf.download(['ES=F', 'NQ=F', 'GC=F', 'SI=F'], period="7d", interval="1h")
+    df_h = h_raw['Close'].rename(columns={'ES=F':'SPX', 'NQ=F':'NDX', 'GC=F':'XAU', 'SI=F':'XAG'}).ffill()
+    df_v = h_raw['Volume'].rename(columns={'ES=F':'SPX', 'NQ=F':'NDX', 'GC=F':'XAU', 'SI=F':'XAG'}).ffill()
 
     # FRED Verileri
     df_f = pd.DataFrame(index=df_y.index)
@@ -46,7 +44,7 @@ def get_pro_engine_data(api_key):
         for name, s_id in fred_ids.items():
             try:
                 url = f"https://api.stlouisfed.org/fred/series/observations?series_id={s_id}&api_key={api_key}&file_type=json&sort_order=desc&limit=5"
-                r = requests.get(url, timeout=5).json()
+                r = requests.get(url).json()
                 obs = pd.DataFrame(r['observations'])[['date', 'value']]
                 obs['value'] = pd.to_numeric(obs['value'], errors='coerce')
                 obs['date'] = pd.to_datetime(obs['date'])
@@ -54,44 +52,54 @@ def get_pro_engine_data(api_key):
             except: pass
     return df_y, df_h, df_v, df_f.ffill()
 
-def z_roll(s, win=126): return (s - s.rolling(win).mean()) / s.rolling(win).std()
+def z_roll(s, win=126):
+    return (s - s.rolling(win, min_periods=1).mean()) / s.rolling(win, min_periods=1).std()
 
-# --- 2. ANA AKIŞ ---
+# --- 2. HESAPLAMA VE KALİBRASYON ---
 try:
-    df_y, df_h, df_v, df_f = get_pro_engine_data(fred_api_key)
-    reel_faiz = df_y['TNX'] - (df_f['T10YIE'] if 'T10YIE' in df_f.columns else 2.1)
+    df_y, df_h, df_v, df_f = get_v5_data(FRED_API_KEY)
     
-    st.title("🏛️ MACRO FORCE TERMINAL PRO")
-    st.caption(f"🕒 Son Güncelleme: {datetime.now().strftime('%H:%M:%S')} | Hacim Z-Skoru Kalibrasyonu Aktif")
-
-    # --- OOS HIT-RATE HESAPLAMA ---
-    z_rf, z_dxy = z_roll(reel_faiz), z_roll(df_y['DXY'])
+    # Faktörler
+    breakeven = df_f['T10YIE'] if 'T10YIE' in df_f.columns else 2.1
+    reel_faiz = df_y['TNX'] - breakeven
+    
+    z_rf = z_roll(reel_faiz)
+    z_dxy = z_roll(df_y['DXY'])
     z_liq = z_roll(df_f['WALCL']) if 'WALCL' in df_f.columns else -z_roll(df_y['TNX'])
-    z_spr = z_roll(df_f['SPREAD']) if 'SPREAD' in df_f.columns else z_roll(df_y['VIX'])
-    
-    # 5 Günlük Tahmin Başarısı (S&P 500 bazlı)
-    total_sig_series = (0.4 * -(z_rf + z_dxy)/2) + (0.3 * z_liq) + (0.3 * -z_spr)
-    prediction = total_sig_series.shift(5)
-    outcome = df_y['SPX'].pct_change(5)
-    hr = float((np.sign(prediction) == np.sign(outcome)).tail(126).mean() * 100)
+    z_spr = z_roll(df_f['SPREAD']) if 'SPREAD' in df_f.columns else z_roll(100 - df_y['HYG'])
 
-    # OOS ROZETİ
-    h_c = "#00ff00" if hr >= 60 else "#ffff00" if hr >= 45 else "#ff4b4b"
+    # --- OOS HIT-RATE DÜZELTME (SIGN FLIP CHECK) ---
+    # Fiyatla pozitif korelasyonlu bir sinyal serisi oluşturuyoruz
+    # (Likidite +1) + (Faiz -1) + (Dolar -1) + (Spread -1)
+    signal_series = (0.3 * z_liq) + (0.4 * -(z_rf + z_dxy)/2) + (0.3 * -z_spr)
+    
+    prediction = signal_series.shift(5)
+    actual_return = df_y['SPX'].pct_change(5)
+    
+    # Başarı oranı (Son 126 gün)
+    hits = (np.sign(prediction) == np.sign(actual_return)).tail(126)
+    hr = float(hits.mean() * 100)
+
+    # --- UI BAŞLIĞI ---
+    st.title("🏛️ MACRO FORCE TERMINAL PRO")
+    
+    h_c = "#00ff00" if hr >= 55 else "#ffff00" if hr >= 40 else "#ff4b4b"
     st.markdown(f"""
         <div class="hit-rate-badge" style="border-color:{h_c}; color:{h_c};">
-            <small>OOS HIT-RATE GÜVEN ROZETİ</small><br>
-            <b style="font-size:24px;">%{hr:.1f}</b>
+            <small>OOS HIT-RATE (GÜVEN ENDEKSİ)</small><br>
+            <b style="font-size:32px;">%{hr:.1f}</b><br>
+            <span>{'UYUMLU REJİM' if hr >= 55 else 'PİYASA KARARSIZ' if hr >= 40 else 'TERS REJİM / DİKKAT'}</span>
         </div>
     """, unsafe_allow_html=True)
 
-    # --- MAKRO METRIKLER ---
-    m1, m2, m3, m4 = st.columns(4)
-    m1.metric("Reel Faiz", f"%{reel_faiz.iloc[-1]:.2f}", f"{z_rf.iloc[-1]:.2f}z")
-    m2.metric("DXY", f"{df_y['DXY'].iloc[-1]:.2f}", f"{z_dxy.iloc[-1]:.2f}z")
-    l_v = float(df_f['WALCL'].iloc[-1]/1000000) if 'WALCL' in df_f.columns else 0
-    m3.metric("Likidite", f"{l_v:.2f}T", f"{z_liq.iloc[-1]:.2f}z")
-    s_v = float(df_f['SPREAD'].iloc[-1]) if 'SPREAD' in df_f.columns else 0
-    m4.metric("Kredi Spread", f"%{s_v:.2f}", f"{z_spr.iloc[-1]:.2f}z")
+    # METRIKLER
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Reel Faiz", f"%{reel_faiz.iloc[-1]:.2f}", f"{z_rf.iloc[-1]:.2f}z")
+    c2.metric("DXY", f"{df_y['DXY'].iloc[-1]:.2f}", f"{z_dxy.iloc[-1]:.2f}z")
+    liq_t = float(df_f['WALCL'].iloc[-1]/1000000) if 'WALCL' in df_f.columns else 0
+    c3.metric("Likidite", f"{liq_t:.2f}T", f"{z_liq.iloc[-1]:.2f}z")
+    spr_v = float(df_f['SPREAD'].iloc[-1]) if 'SPREAD' in df_f.columns else 0
+    c4.metric("Kredi Spread", f"%{spr_v:.2f}", f"{z_spr.iloc[-1]:.2f}z")
 
     st.divider()
 
@@ -103,51 +111,57 @@ try:
         # Makro Skor
         m_skor = float((0.4 * -(z_rf + z_dxy).iloc[-1]/2) + (0.3 * z_liq.iloc[-1] * signs[1]) + (0.3 * z_spr.iloc[-1] * signs[2]))
         
-        # --- VOL Z-SCORE & FORCE MOMENTUM ---
-        p_now, p_prev = df_h[name].iloc[-1], df_h[name].iloc[-5]
+        # --- HACİM VE İVME KALİBRASYONU ---
+        p_now, p_prev = df_h[name].iloc[-1], df_h[name].iloc[-5] # 4 Saatlik
         v_now = df_v[name].iloc[-1]
+        v_avg_24 = df_v[name].rolling(24).mean().iloc[-1]
         
-        # Hacim Z-Skoru (Son 24 saatlik pencerede)
-        vol_z = (v_now - df_v[name].rolling(24).mean().iloc[-1]) / df_v[name].rolling(24).std().iloc[-1]
+        # Hacim Z-Skoru yerine "Hacim İvmesi" (Current vs 24h Avg)
+        # Eğer hacim 24 saatlik ortalamanın %80'inden fazlaysa onaylı kabul et
+        vol_accel = v_now / v_avg_24 if v_avg_24 > 0 else 0
         
         roc = ((p_now / p_prev) - 1) * 100
         
-        # Karar Mekanizması (Hacim Z-Skoru > 0 ise Onaylı)
-        if roc > 0.05 and vol_z > 0:
-            mom_direction, mom_status = 1, "GÜÇLÜ BOĞA"
-        elif roc < -0.05 and vol_z > 0:
-            mom_direction, mom_status = -1, "GÜÇLÜ AYI"
+        # MOMENTUM KARAR (Daha esnek hacim eşiği)
+        if abs(roc) > 0.05:
+            if vol_accel > 0.75: # Hacim makul seviyedeyse
+                mom_dir = np.sign(roc)
+                mom_label = "HACİMLİ"
+            else:
+                mom_dir = 0
+                mom_label = "HACİMSİZ"
         else:
-            mom_direction, mom_status = 0, "DÜŞÜK HACİM/BELİRSİZ"
+            mom_dir = 0
+            mom_label = "YATAY"
 
-        # Diverjanz / Trend Mantığı
-        is_divergent = (np.sign(m_skor) != mom_direction) and (mom_direction != 0)
+        # DİNAMİK RENK VE DURUM
+        is_div = (np.sign(m_skor) != mom_dir) and (mom_dir != 0)
         
-        if is_divergent:
-            card_class, status_label, s_clr = "diverjanz", "⚠️ DIVERJANZ", "#ffcc00"
-        elif (np.sign(m_skor) == mom_direction) and (mom_direction != 0):
-            card_class, status_label, s_clr = "trend", "✅ TREND", "#00ff00"
+        if is_div:
+            cls, lbl, clr = "diverjanz", "⚠️ DIVERJANZ", "#ffcc00"
+        elif (np.sign(m_skor) == mom_dir) and (mom_dir != 0):
+            cls, lbl, clr = "trend", "✅ TREND", "#00ff00"
         else:
-            card_class, status_label, s_clr = "zayif", "❌ ZAYIF", "#ff4b4b"
+            cls, lbl, clr = "zayif", "❌ ZAYIF", "#ff4b4b"
             
-        sig = "AL" if m_skor > 0.15 else ("SAT" if m_skor < -0.15 else "NOTR")
+        sig = "AL" if m_skor > 0.1 else ("SAT" if m_skor < -0.1 else "NOTR")
         p_clr = "#00ff00" if roc > 0 else "#ff4b4b"
         
         with cols[i%2]:
             st.markdown(f"""
-            <div class="card {card_class}">
-                <div style="display:flex; justify-content:space-between; align-items:center;">
+            <div class="card {cls}">
+                <div style="display:flex; justify-content:space-between;">
                     <b style="font-size:20px;">{name}</b>
                     <b style="color:{p_clr}; font-size:18px;">%{roc:.2f}</b>
                 </div>
                 <p style="margin:5px 0; font-size:14px; color:#ccc;">
-                    Makro: {m_skor:.2f} ({'BOĞA' if m_skor>0 else 'AYI'}) | Hacim Z: {vol_z:.2f}
+                    Makro: {m_skor:.2f} | Hacim İvme: {vol_accel:.2f}x ({mom_label})
                 </p>
                 <div style="background:rgba(0,0,0,0.3); padding:8px; border-radius:5px; margin-top:5px;">
-                    <b style="color:{s_clr}; font-size:16px;">{sig} - {status_label}</b>
+                    <b style="color:{clr}; font-size:17px;">{sig} - {lbl}</b>
                 </div>
             </div>
             """, unsafe_allow_html=True)
 
 except Exception as e:
-    st.error(f"Sistem Hatası: {e}")
+    st.error(f"Kritik Hata: {e}")

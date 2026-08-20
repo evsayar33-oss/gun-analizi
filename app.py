@@ -13,7 +13,7 @@ if not is_headless:
     st.set_page_config(page_title="Sentinel V20 Pro", layout="wide")
     st.markdown("<style>.main { background-color: #05070a; color: white; }</style>", unsafe_allow_html=True)
 
-# SECRETS
+# SECRETS (Ortama göre çek)
 if is_headless:
     TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
     CHAT_ID = os.environ.get("CHAT_ID")
@@ -47,37 +47,33 @@ def fetch_data():
         for name, s_id in fred_ids.items():
             try:
                 r = requests.get(f"https://api.stlouisfed.org/fred/series/observations?series_id={s_id}&api_key={FRED_API_KEY}&file_type=json", timeout=5).json()
-                obs = pd.DataFrame(r['observations'])[['date', 'value']]
-                obs['value'] = pd.to_numeric(obs['value'], errors='coerce')
-                obs['date'] = pd.to_datetime(obs['date'])
-                df_f[name] = obs.set_index('date')['value'].reindex(df_y.index, method='ffill')
+                if 'observations' in r:
+                    obs = pd.DataFrame(r['observations'])[['date', 'value']]
+                    obs['value'] = pd.to_numeric(obs['value'], errors='coerce')
+                    obs['date'] = pd.to_datetime(obs['date'])
+                    df_f[name] = obs.set_index('date')['value'].reindex(df_y.index, method='ffill')
             except: pass
     
-    # Fallback for FRED
     if 'SPREAD' not in df_f.columns: df_f['SPREAD'] = (100 - df_y['HYG']).rolling(20).mean()
     if 'T10YIE' not in df_f.columns: df_f['T10YIE'] = 2.1
     if 'WALCL' not in df_f.columns: df_f['WALCL'] = 7150000
-
     return df_y, df_h, df_f.ffill().bfill()
 
 # --- ANA MOTOR ---
 try:
     df_y, df_h, df_f = fetch_data()
-    master = pd.concat([df_y, df_f], axis=1).ffill()
-    
-    z_rf = z_score(master['TNX'] - master['T10YIE'])
-    z_dxy = z_score(master['DXY'])
-    z_spr = z_score(master['SPREAD'])
-    z_liq = z_score(master['WALCL'])
+    z_rf = z_score(df_y['TNX'] - df_f['T10YIE'])
+    z_dxy = z_score(df_y['DXY'])
+    z_liq = z_score(df_f['WALCL'])
+    z_spr = z_score(df_f['SPREAD'])
 
     assets = {'SPX':[-1,1,-1], 'NDX':[-1,1,-1], 'XAU':[-1,1,1], 'XAG':[-1,1,-1]}
     current_results = {}
 
-    # Hafıza Dosyasını Oku
     if os.path.exists(STATE_FILE):
         try:
             old_df = pd.read_csv(STATE_FILE, index_col=0)
-            old_scores = old_df.to_dict()['score']
+            old_scores = old_df['score'].to_dict()
         except: old_scores = {}
     else: old_scores = {}
 
@@ -86,7 +82,6 @@ try:
         cols = st.columns(4)
 
     for i, (name, signs) in enumerate(assets.items()):
-        # Hesaplama
         m_env = (0.5 * z_liq.iloc[-1] + 0.3 * -(z_rf.iloc[-1] + z_dxy.iloc[-1])/2 + 0.2 * z_spr.iloc[-1] * signs[2])
         roc = ((df_h[name].iloc[-1] / df_h[name].iloc[-5]) - 1) * 100
         total_score = round((m_env * 0.4) + (roc * 4.5), 2)
@@ -94,7 +89,6 @@ try:
         signal = "AL" if total_score > 0.15 else ("SAT" if total_score < -0.15 else "NOTR")
         current_results[name] = total_score
 
-        # ALARM KONTROLÜ
         if name in old_scores:
             diff = total_score - old_scores[name]
             if abs(diff) > 0.60:
@@ -102,13 +96,13 @@ try:
             
             old_sig = "AL" if old_scores[name] > 0.15 else ("SAT" if old_scores[name] < -0.15 else "NOTR")
             if old_sig != signal and signal != "NOTR":
-                send_telegram(f"🚀 *SİNYAL DÖNÜŞÜ: {name}*\nYön: `{old_sig}` -> *{signal}*")
+                emoji = "🚀" if signal == "AL" else "📉"
+                send_telegram(f"{emoji} *SİNYAL DÖNÜŞÜ: {name}*\nYön: `{old_sig}` -> *{signal}*")
 
         if not is_headless:
             with cols[i]:
                 st.metric(name, total_score, signal)
 
-    # Skorları kalıcı olarak kaydet
     pd.DataFrame.from_dict(current_results, orient='index', columns=['score']).to_csv(STATE_FILE)
 
 except Exception as e:

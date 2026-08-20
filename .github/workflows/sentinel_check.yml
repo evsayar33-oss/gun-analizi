@@ -1,7 +1,7 @@
 name: 7/24 Sentinel Alert Engine
 on:
   schedule:
-    - cron: '*/30 * * * *' # Her 30 dakikada bir kesin kontrol
+    - cron: '*/30 * * * *' # Her 30 dakikada bir kontrol
   workflow_dispatch:
 jobs:
   check:
@@ -12,10 +12,12 @@ jobs:
         uses: actions/setup-python@v4
         with:
           python-version: '3.9'
-      - run: pip install pandas numpy yfinance requests
+      - name: Install dependencies
+        run: |
+          pip install pandas numpy yfinance requests streamlit
       - name: Run Alert Logic
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           CHAT_ID: ${{ secrets.CHAT_ID }}
           FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
-        run: python app.py # Burada app.py'yi direkt script olarak calistirir
+        run: python app.py --headless # Kodu headless modda calistir

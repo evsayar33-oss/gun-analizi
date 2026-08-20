@@ -1,20 +1,22 @@
 name: 7/24 Sentinel Alert Engine
 on:
   schedule:
-    - cron: '*/30 * * * *' # 30 dakikada bir kesin kontrol
+    - cron: '*/30 * * * *' # 30 dakikada bir kontrol
   workflow_dispatch:
 jobs:
   check:
     runs-on: ubuntu-latest
     permissions:
-      contents: write # Dosya kaydetme izni
+      contents: write
     steps:
       - uses: actions/checkout@v3
       - name: Set up Python
         uses: actions/setup-python@v4
         with:
           python-version: '3.9'
-      - run: pip install pandas numpy yfinance requests streamlit
+      - name: Install dependencies
+        run: |
+          pip install pandas numpy yfinance requests streamlit
       - name: Run Alert Logic
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
@@ -26,5 +28,5 @@ jobs:
           git config --global user.name "Sentinel-Bot"
           git config --global user.email "actions@github.com"
           git add last_scores.csv
-          git commit -m "Update scores [skip ci]" || echo "No changes"
+          git commit -m "Update scores [skip ci]" || echo "No changes to commit"
           git push

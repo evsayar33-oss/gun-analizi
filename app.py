@@ -11,8 +11,9 @@ is_headless = "--headless" in sys.argv
 if not is_headless:
     import streamlit as st
     from streamlit_autorefresh import st_autorefresh
-    st_autorefresh(interval=900 * 1000, key="sentinel_pure_v22")
-    st.set_page_config(page_title="Sentinel V22.1 Heartbeat", layout="wide")
+    # Web sitesi 15 dakikada bir yenilenir
+    st_autorefresh(interval=900 * 1000, key="sentinel_silent_v22")
+    st.set_page_config(page_title="Alpha Sentinel Silent", layout="wide")
     st.markdown("<style>.main { background-color: #05070a; color: white; }</style>", unsafe_allow_html=True)
 
 # SECRETS
@@ -38,11 +39,11 @@ def z_score(s, win=126):
 
 def fetch_data():
     syms = {'SPX':'ES=F', 'NDX':'NQ=F', 'XAU':'GC=F', 'XAG':'SI=F', 'DXY':'DX-Y.NYB', 'TNX':'^TNX', 'VIX':'^VIX', 'HYG':'HYG'}
-    raw_y = yf.download(list(syms.values()), period="5y", interval="1d", progress=False)
-    df_y = raw_y['Close'].ffill().bfill().rename(columns={v: k for k, v in syms.items()})
-    h_raw = yf.download(['ES=F', 'NQ=F', 'GC=F', 'SI=F'], period="5d", interval="15m", progress=False)
-    df_h_close = h_raw['Close'].rename(columns={'ES=F':'SPX', 'NQ=F':'NDX', 'GC=F':'XAU', 'SI=F':'XAG'}).ffill()
-    df_h_vol = h_raw['Volume'].rename(columns={'ES=F':'SPX', 'NQ=F':'NDX', 'GC=F':'XAU', 'SI=F':'XAG'}).ffill()
+    df_y = yf.download(list(syms.values()), period="5y", interval="1d", progress=False)['Close'].ffill().bfill()
+    df_y = df_y.rename(columns={v: k for k, v in syms.items()})
+    df_h = yf.download(['ES=F', 'NQ=F', 'GC=F', 'SI=F'], period="2d", interval="15m", progress=False)
+    df_h_close = df_h['Close'].rename(columns={'ES=F':'SPX', 'NQ=F':'NDX', 'GC=F':'XAU', 'SI=F':'XAG'}).ffill()
+    df_h_vol = df_h['Volume'].rename(columns={'ES=F':'SPX', 'NQ=F':'NDX', 'GC=F':'XAU', 'SI=F':'XAG'}).ffill()
     
     df_f = pd.DataFrame(index=df_y.index)
     if FRED_API_KEY:
@@ -55,7 +56,6 @@ def fetch_data():
                 df_f['WALCL'] = obs.set_index('date')['value'].reindex(df_y.index, method='ffill')
         except: pass
     
-    # Defaults
     if 'WALCL' not in df_f.columns: df_f['WALCL'] = 7150000
     df_f['T10YIE'] = 2.1
     df_f['SPREAD'] = (100 - df_y['HYG']).rolling(20).mean()
@@ -73,68 +73,55 @@ try:
 
     assets = {'SPX':[-1,1,-1], 'NDX':[-1,1,-1], 'XAU':[-1,1,1], 'XAG':[-1,1,-1]}
     current_results = {}
-    alert_triggered = False
 
-    # HAFIZA DOSYASI OKUMA (Garantili Mod)
+    # Önceki skorları yükle
     if os.path.exists(STATE_FILE):
         try:
             old_df = pd.read_csv(STATE_FILE)
-            # Eğer 'index' veya 'score' sütunları varsa onları kullan
-            if 'score' in old_df.columns:
-                # İlk sütunu (hisse adı) index yap
-                old_scores = old_df.set_index(old_df.columns[0])['score'].to_dict()
-            else: old_scores = {}
+            old_scores = old_df.set_index(old_df.columns[0])['score'].to_dict()
         except: old_scores = {}
     else: old_scores = {}
 
     for i, (name, signs) in enumerate(assets.items()):
-        # 1. MAKRO SKOR
+        # 1. Makro Temel
         m_env = (0.5 * z_liq.iloc[-1] + 0.3 * -(z_rf.iloc[-1] + z_dxy.iloc[-1])/2 + 0.2 * z_spr.iloc[-1] * signs[2])
-        
-        # 2. MOMENTUM + HACİM KİLİDİ
+        # 2. Hacim Onaylı Momentum (Pure Quant)
         roc_1h = ((df_h[name].iloc[-1] / df_h[name].iloc[-5]) - 1) * 100
         v_series = df_v[name].tail(96)
         v_z = (df_v[name].iloc[-1] - v_series.mean()) / (v_series.std() + 1e-9)
         
-        # Hacim kilidini test için 0.5'e çektim (Normalde 1.0)
-        momentum_impact = roc_1h * 4.5 if v_z > 0.5 else roc_1h * 0.5
-        total_score = round((m_env * 0.4) + (momentum_impact * 0.6), 2)
+        # Momentum çarpanı (Hacim varsa 4.5x, yoksa 0.5x)
+        mom_impact = roc_1h * 4.5 if v_z > 0.5 else roc_1h * 0.5
+        total_score = round((m_env * 0.4) + (mom_impact * 0.6), 2)
         
         signal = "AL" if total_score > 0.30 else ("SAT" if total_score < -0.30 else "NOTR")
         current_results[name] = total_score
 
-        # ALARM DENETİMİ
+        # ALARM DENETİMİ (SADECE DEĞİŞİM VARSA)
         if name in old_scores:
             old_val = old_scores[name]
             diff = total_score - old_val
             
-            # Sinyal Dönüşü
+            # Sinyal Dönüşü (Hacimle destekleniyorsa)
             old_sig = "AL" if old_val > 0.30 else ("SAT" if old_val < -0.30 else "NOTR")
             if old_sig != signal and signal != "NOTR" and v_z > 0.6:
-                send_telegram(f"🚀 *SİNYAL DÖNÜŞÜ: {name}*\nYön: `{old_sig}` -> *{signal}*\nSkor: `{total_score}` (Hacim: {v_z:.1f}z)")
-                alert_triggered = True
+                emoji = "🚀" if signal == "AL" else "📉"
+                send_telegram(f"{emoji} *SİNYAL DÖNÜŞÜ: {name}*\n`{old_sig}` -> *{signal}*\nSkor: `{total_score}` (Hacim: {v_z:.1f}z)")
             
-            # Güçlü Skor Değişimi
+            # Güçlü Skor Sıçraması (Balina/Haber Kontrolü)
             if abs(diff) > 1.0 and v_z > 0.5:
-                send_telegram(f"🚨 *GÜÇLÜ DEĞİŞİM: {name}*\nEski: `{old_val}` -> Yeni: *{total_score}*\nFark: `{diff:+.2f}`")
-                alert_triggered = True
+                send_telegram(f"🚨 *GÜÇLÜ SKOR DEĞİŞİMİ: {name}*\nEski: `{old_val}` -> Yeni: *{total_score}*\nFark: `{diff:+.2f}`")
 
-    # MANUEL ÇALIŞTIRMA İÇİN HEARTBEAT (Canlılık kanıtı)
-    if is_headless and not alert_triggered:
-        # Eğer bu bir manuel tetiklemeyse (workflow_dispatch) mesaj at
-        # Ama otomatik cron ise sessiz kal
-        send_telegram("📡 *SENTINEL:* Tarama yapıldı. Kritik bir değişim veya hacimli kırılım yok. İzlemeye devam ediliyor.")
-
-    # WEB UI
+    # WEB ARAYÜZÜ (Dashboard her zaman taze kalır)
     if not is_headless:
-        st.title("🏛️ ALPHA SENTINEL V22.1")
+        st.title("🏛️ ALPHA SENTINEL V22 - SILENT")
         cols = st.columns(4)
         for i, (name, sc) in enumerate(current_results.items()):
-            with cols[i]: st.metric(name, sc, signal)
+            with cols[i]: st.metric(name, sc, "AL" if sc > 0.30 else "SAT" if sc < -0.30 else "NOTR")
 
-    # Kaydet
+    # Yeni skorları kaydet (Bir sonraki 15 dk için hafıza)
     pd.DataFrame.from_dict(current_results, orient='index', columns=['score']).to_csv(STATE_FILE)
 
 except Exception as e:
-    if is_headless: send_telegram(f"❌ *SİSTEM HATASI:* {str(e)}")
+    if is_headless: print(f"Hata: {e}")
     else: st.error(f"Hata: {e}")
